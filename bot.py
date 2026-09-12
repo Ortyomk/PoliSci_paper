@@ -95,8 +95,8 @@ CROSSREF_JOURNALS = [
         "issns": ["1350-1763", "1466-4429"]
     },
     {
-        "name": "International Affairs (Chatham House)",
-        "issns": ["0020-5850", "1468-2346"]
+        "name": "World Politics (Princeton / Cambridge)",
+        "issns": ["0043-8871", "1086-3338"]
     },
     {
         "name": "Perspectives on Politics",

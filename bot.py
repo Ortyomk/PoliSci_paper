@@ -8,7 +8,6 @@ import requests
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Ленты журналов по политологии
 FEEDS = [
     # Cambridge: American Political Science Review
     "https://www.cambridge.org/core/rss/product/id/6A72635B891F965FE8A1E7DAECACDB8C",
@@ -43,9 +42,6 @@ def save_seen(seen_ids: set):
         json.dump(sorted(list(seen_ids)), f, ensure_ascii=False, indent=2)
 
 def send_post(title: str, link: str, summary: str, source: str):
-    if not BOT_TOKEN or not CHAT_ID:
-        raise ValueError("TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы в Secrets!")
-
     clean_title = html.escape(title.strip())
     clean_source = html.escape(source.strip())
     
@@ -54,7 +50,7 @@ def send_post(title: str, link: str, summary: str, source: str):
         f"🏛 <i>{clean_source}</i>\n\n"
     )
     if summary:
-        short_summary = html.escape(summary[:350].rsplit(" ", 1)[0])
+        short_summary = html.escape(summary[:300].rsplit(" ", 1)[0])
         html_text += f"{short_summary}...\n\n"
     
     if link:
@@ -70,64 +66,57 @@ def send_post(title: str, link: str, summary: str, source: str):
 
     res = requests.post(url, json=payload, timeout=20)
     
-    # Если Telegram отклонил HTML-разметку, переотправляем чистым текстом
+    # Если ошибка 400 вызвана HTML-разметкой, отправляем чистым текстом
     if not res.ok:
-        print(f"[WARN] Ошибка отправки HTML: {res.text}. Пробую отправить без форматирования...")
+        print(f"[WARN] Telegram вернул {res.status_code}: {res.text}. Пробую чистый текст...")
         plain_text = f"📄 {title.strip()}\n\n🏛 {source.strip()}\n\n"
         if summary:
-            plain_text += f"{summary[:350].rsplit(' ', 1)[0]}...\n\n"
+            plain_text += f"{summary[:300].rsplit(' ', 1)[0]}...\n\n"
         if link:
             plain_text += f"🔗 Ссылка: {link.strip()}"
         
-        payload["text"] = plain_text
-        payload.pop("parse_mode", None)
-        res = requests.post(url, json=payload, timeout=20)
+        res = requests.post(url, json={"chat_id": CHAT_ID, "text": plain_text}, timeout=20)
 
     if not res.ok:
-        print(f"[ERROR] Детали ошибки Telegram API: {res.status_code} — {res.text}")
+        print(f"[FATAL ERROR] Ответ Telegram API: {res.text}")
     
     res.raise_for_status()
 
 def main():
     seen = load_seen()
     new_seen = set(seen)
-    print(f"[INFO] В базе уже сохранено {len(seen)} публикаций.")
+    print(f"[INFO] В базе сохранено публикаций: {len(seen)}")
 
     for url in FEEDS:
         print(f"\n[INFO] Проверяю: {url}")
         try:
             resp = requests.get(url, headers=HEADERS, timeout=25)
             if resp.status_code != 200:
-                print(f"[WARN] Источник вернул HTTP {resp.status_code}, пропускаю.")
+                print(f"[WARN] HTTP {resp.status_code}, пропускаю.")
                 continue
 
             feed = feedparser.parse(resp.content)
             source_name = feed.feed.get("title", "Научный журнал")
-            entries = feed.entries[:5]
-            print(f"[INFO] Получено записей: {len(entries)} (Журнал: {source_name})")
+            entries = feed.entries[:3]
+            print(f"[INFO] Найдено записей: {len(entries)}")
 
             for entry in entries:
                 article_id = entry.get("id") or entry.get("link")
-                if not article_id:
+                if not article_id or article_id in seen:
                     continue
 
-                if article_id in seen:
-                    continue
-
-                title = entry.get("title", "Новая статья")
+                title = entry.get("title", "Новая публикация")
                 link = entry.get("link", "")
-                raw_summary = entry.get("summary") or entry.get("description") or ""
-                summary = clean_html(raw_summary)
+                summary = clean_html(entry.get("summary") or entry.get("description") or "")
 
-                print(f"[POST] Отправляю в канал: {title[:50]}...")
+                print(f"[POST] Отправка: {title[:40]}...")
                 send_post(title, link, summary, source_name)
                 new_seen.add(article_id)
 
         except Exception as e:
-            print(f"[ERROR] Ошибка при обработке фида {url}: {e}")
+            print(f"[ERROR] Ошибка ленты {url}: {e}")
 
     save_seen(new_seen)
-    print("\n[INFO] Синхронизация завершена.")
 
 if __name__ == "__main__":
     main()

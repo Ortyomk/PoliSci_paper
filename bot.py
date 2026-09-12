@@ -3,6 +3,7 @@ import json
 import html
 import re
 import time
+from datetime import datetime, timezone
 import feedparser
 import requests
 
@@ -11,19 +12,25 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 SEEN_FILE = "seen_articles.json"
 
-# Вежливый User-Agent для Crossref (помещает запросы в приоритетный пул API)
 CROSSREF_HEADERS = {
-    "User-Agent": "PoliSciRadarBot/1.0 (https://github.com; mailto:polisci-bot@actions.local)"
+    "User-Agent": "PoliSciRadarBot/1.1 (https://github.com; mailto:polisci-bot@actions.local)"
 }
 RSS_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-# --------------------------------------------------------------------------
-# СПИСОК ЖУРНАЛОВ ДЛЯ МОНИТОРИНГА ЧЕРЕЗ CROSSREF (ПО ISSN)
-# --------------------------------------------------------------------------
+# Ключевые слова для отсева обложек, оглавлений и технических страниц
+TRASH_KEYWORDS = [
+    "front matter", "back matter", "cover and", "cover page",
+    "table of contents", "contents", "issue information",
+    "editorial board", "corrigendum", "erratum", "errata",
+    "author index", "subject index", "book review", "book reviews",
+    "volume index", "title page", "preface", "acknowledgement",
+    "in memoriam", "obituary"
+]
+
 CROSSREF_JOURNALS = [
-    # --- Российские издания (ВАК К1 / RSCI / РАН) ---
+    # --- Российские издания (ВАК К1 / RSCI / РАН / МГИМО) ---
     {
         "name": "Полис. Политические исследования",
         "issns": ["1026-9487", "2071-8713"]
@@ -67,6 +74,10 @@ CROSSREF_JOURNALS = [
         "issns": ["0010-4140", "1552-3829"]
     },
     {
+        "name": "International Organization (Cambridge)",
+        "issns": ["0020-8183", "1531-5088"]
+    },
+    {
         "name": "West European Politics",
         "issns": ["0140-2382", "1743-9655"]
     },
@@ -95,16 +106,11 @@ CROSSREF_JOURNALS = [
         "issns": ["1350-1763", "1466-4429"]
     },
     {
-        "name": "World Politics (Princeton / Cambridge)",
-        "issns": ["0043-8871", "1086-3338"]
-    },
-    {
         "name": "Perspectives on Politics",
         "issns": ["1537-5927", "1541-0986"]
     }
 ]
 
-# Прямые RSS-ленты (для источников, где RSS стабильно отдаётся без блокировок)
 RSS_FEEDS = [
     {
         "name": "Comparative Political Studies (SAGE RSS)",
@@ -114,11 +120,28 @@ RSS_FEEDS = [
 
 
 def clean_html(raw_html: str) -> str:
-    """Удаляет теги XML/HTML и нормализует пробелы."""
     if not raw_html:
         return ""
     clean = re.sub(r"<[^>]+>", " ", raw_html)
     return " ".join(clean.split())
+
+
+def is_trash_title(title: str) -> bool:
+    """Проверяет, не является ли запись обложкой, оглавлением или опечаткой."""
+    lowered = title.lower()
+    return any(keyword in lowered for keyword in TRASH_KEYWORDS)
+
+
+def extract_pub_year(item: dict) -> int:
+    """Извлекает год публикации из метаданных Crossref."""
+    for key in ("published-online", "published-print", "published", "issued", "created"):
+        parts = item.get(key, {}).get("date-parts", [])
+        if parts and parts[0] and parts[0][0]:
+            try:
+                return int(parts[0][0])
+            except (ValueError, TypeError):
+                pass
+    return 0
 
 
 def load_seen() -> set:
@@ -139,7 +162,6 @@ def save_seen(seen_ids: set):
 
 
 def send_telegram_message(text: str, parse_mode: str = "HTML") -> bool:
-    """Отправляет сообщение в Telegram с защитой от лимитов (Error 429)."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
@@ -153,14 +175,13 @@ def send_telegram_message(text: str, parse_mode: str = "HTML") -> bool:
         res = requests.post(url, json=payload, timeout=20)
         if res.status_code == 429:
             retry_after = res.json().get("parameters", {}).get("retry_after", 10)
-            print(f"[WARN] Превышен лимит сообщений Telegram. Ожидание {retry_after} сек...")
+            print(f"[WARN] Лимит сообщений Telegram. Ждем {retry_after} сек...")
             time.sleep(retry_after + 1)
             continue
         if res.ok:
             return True
         if "can't parse entities" in res.text and parse_mode:
-            # Сбой разметки — пробуем отправить чистым текстом
-            print("[WARN] Сбой HTML-парсинга, переотправка чистым текстом...")
+            print("[WARN] Ошибка разметки, отправляю чистым текстом...")
             return send_telegram_message(clean_html(text), parse_mode="")
         print(f"[ERROR] Ошибка Telegram ({res.status_code}): {res.text}")
         break
@@ -189,13 +210,16 @@ def post_article(title: str, link: str, journal: str, authors: str = "", summary
 
     success = send_telegram_message(msg, parse_mode="HTML")
     if success:
-        # Пауза в 2 секунды между постами, чтобы не перегружать канал
         time.sleep(2.0)
     return success
 
 
-def fetch_from_crossref(journal_cfg: dict, rows: int = 2) -> list:
-    """Получает последние опубликованные статьи журнала через Crossref REST API."""
+def fetch_from_crossref(journal_cfg: dict, rows: int = 4) -> list:
+    """Получает свежие статьи через Crossref REST API с фильтрацией по дате и контенту."""
+    current_year = datetime.now(timezone.utc).year
+    # Статьи старше прошлого года игнорируются
+    min_year = current_year - 1
+
     articles = []
     for issn in journal_cfg["issns"]:
         url = "https://api.crossref.org/works"
@@ -219,11 +243,28 @@ def fetch_from_crossref(journal_cfg: dict, rows: int = 2) -> list:
                 if not doi:
                     continue
 
+                # 1. Проверка года публикации
+                year = extract_pub_year(item)
+                if year and year < min_year:
+                    print(f"    [SKIP OLD] Статья {doi} от {year} года (слишком старая)")
+                    continue
+
+                # 2. Выбор названия (приоритет кириллице, если есть)
                 titles = item.get("title", [])
-                title = titles[0] if titles else "Без названия"
+                chosen_title = titles[0] if titles else "Без названия"
+                for t in titles:
+                    if re.search(r"[а-яА-ЯёЁ]", t):
+                        chosen_title = t
+                        break
+
+                # 3. Отсев обложек, оглавлений и служебных страниц
+                if is_trash_title(chosen_title):
+                    print(f"    [SKIP TRASH] Пропуск тех. страницы: {chosen_title}")
+                    continue
+
                 link = item.get("URL") or f"https://doi.org/{doi}"
 
-                # Форматирование списка авторов: И. Иванов, П. Петров
+                # 4. Форматирование авторов
                 raw_authors = item.get("author", [])
                 authors_list = []
                 for a in raw_authors[:4]:
@@ -238,31 +279,29 @@ def fetch_from_crossref(journal_cfg: dict, rows: int = 2) -> list:
                 else:
                     authors_str = ", ".join(authors_list)
 
-                # Обработка аннотации
+                # 5. Аннотация
                 raw_abstract = item.get("abstract", "")
                 abstract = clean_html(raw_abstract)
 
                 articles.append({
                     "id": f"doi:{doi.lower()}",
-                    "title": title,
+                    "title": chosen_title,
                     "link": link,
                     "journal": journal_cfg["name"],
                     "authors": authors_str,
                     "summary": abstract
                 })
-            
-            # Если по первому ISSN данные успешно найдены — прерываем перебор
+
             if articles:
                 break
 
         except Exception as e:
-            print(f"[WARN] Сбой при запросе к Crossref для {issn}: {e}")
+            print(f"[WARN] Ошибка Crossref для {issn}: {e}")
 
     return articles
 
 
-def fetch_from_rss(feed_cfg: dict, rows: int = 2) -> list:
-    """Получает публикации из прямого RSS-фида."""
+def fetch_from_rss(feed_cfg: dict, rows: int = 3) -> list:
     articles = []
     try:
         r = requests.get(feed_cfg["url"], headers=RSS_HEADERS, timeout=20)
@@ -272,12 +311,14 @@ def fetch_from_rss(feed_cfg: dict, rows: int = 2) -> list:
         feed = feedparser.parse(r.content)
         for entry in feed.entries[:rows]:
             art_id = entry.get("id") or entry.get("link")
-            if not art_id:
+            title = entry.get("title", "Новая публикация")
+
+            if not art_id or is_trash_title(title):
                 continue
 
             articles.append({
                 "id": f"rss:{art_id}",
-                "title": entry.get("title", "Новая публикация"),
+                "title": title,
                 "link": entry.get("link", ""),
                 "journal": feed_cfg["name"],
                 "authors": "",
@@ -291,46 +332,45 @@ def fetch_from_rss(feed_cfg: dict, rows: int = 2) -> list:
 
 def main():
     if not BOT_TOKEN or not CHAT_ID:
-        raise ValueError("Токен бота или ID канала не найдены в переменных окружения!")
+        raise ValueError("TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы!")
 
     seen = load_seen()
     new_seen = set(seen)
-    print(f"[INFO] База уже опубликованных записей: {len(seen)}")
+    print(f"[INFO] Сохранено ранее: {len(seen)}")
 
-    # При первом запуске берем по 1 статье с журнала, чтобы не спамить в канал
     is_first_run = len(seen) == 0
-    limit_per_journal = 1 if is_first_run else 2
+    limit = 1 if is_first_run else 2
 
-    # 1. Опрос журналов через Crossref API
-    print(f"\n--- Опрос Crossref API ({len(CROSSREF_JOURNALS)} журналов) ---")
+    # Опрос Crossref
+    print(f"\n--- Crossref API ({len(CROSSREF_JOURNALS)} журналов) ---")
     for j_cfg in CROSSREF_JOURNALS:
         print(f"[CHECK] {j_cfg['name']}...")
-        articles = fetch_from_crossref(j_cfg, rows=limit_per_journal)
+        articles = fetch_from_crossref(j_cfg, rows=limit)
 
         for art in articles:
             if art["id"] in seen:
                 continue
 
-            print(f"  -> Отправляю: {art['title'][:45]}...")
+            print(f"  -> Отправка: {art['title'][:45]}...")
             if post_article(art["title"], art["link"], art["journal"], art["authors"], art["summary"]):
                 new_seen.add(art["id"])
 
-    # 2. Опрос рабочих RSS-лент
-    print(f"\n--- Опрос RSS-потоков ({len(RSS_FEEDS)} лент) ---")
+    # Опрос RSS
+    print(f"\n--- RSS ленты ({len(RSS_FEEDS)}) ---")
     for f_cfg in RSS_FEEDS:
         print(f"[CHECK] {f_cfg['name']}...")
-        articles = fetch_from_rss(f_cfg, rows=limit_per_journal)
+        articles = fetch_from_rss(f_cfg, rows=limit)
 
         for art in articles:
             if art["id"] in seen:
                 continue
 
-            print(f"  -> Отправляю: {art['title'][:45]}...")
+            print(f"  -> Отправка: {art['title'][:45]}...")
             if post_article(art["title"], art["link"], art["journal"], art["authors"], art["summary"]):
                 new_seen.add(art["id"])
 
     save_seen(new_seen)
-    print(f"\n[INFO] Синхронизация завершена. Всего в базе: {len(new_seen)}")
+    print(f"\n[INFO] Синхронизация завершена. Всего записей: {len(new_seen)}")
 
 
 if __name__ == "__main__":

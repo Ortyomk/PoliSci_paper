@@ -15,7 +15,7 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 # True  = бот опрашивает все журналы, заносит текущие номера в базу, НО НЕ ШЛЕТ в канал
 # False = обычный боевой режим (публикует всё новое)
 # --------------------------------------------------------------------------
-SILENT_MODE = True
+SILENT_MODE = False
 
 SEEN_FILE = "seen_issues.json"
 

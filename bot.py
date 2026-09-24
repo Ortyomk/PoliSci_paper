@@ -10,10 +10,17 @@ import requests
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
+# --------------------------------------------------------------------------
+# РЕЖИМ ТИХОЙ СИНХРОНИЗАЦИИ
+# True  = бот опрашивает все журналы, заносит текущие номера в базу, НО НЕ ШЛЕТ в канал
+# False = обычный боевой режим (публикует всё новое)
+# --------------------------------------------------------------------------
+SILENT_MODE = True
+
 SEEN_FILE = "seen_issues.json"
 
 CROSSREF_HEADERS = {
-    "User-Agent": "PoliSciIssueRadar/2.0 (mailto:polisci-bot@actions.local)"
+    "User-Agent": "PoliSciIssueRadar/2.1 (mailto:polisci-bot@actions.local)"
 }
 
 TRASH_KEYWORDS = [
@@ -25,16 +32,16 @@ TRASH_KEYWORDS = [
     "in memoriam", "obituary"
 ]
 
-# Только безопасные издания без юридических рисков
+# ИСКЛЮЧИТЕЛЬНО ПОЛИТОЛОГИЧЕСКИЕ И МЕЖДУНАРОДНЫЕ ИЗДАНИЯ (ТОЧНЫЕ ISSN)
 CROSSREF_JOURNALS = [
-    # --- Ведущие российские издания (ВАК К1 / RSCI / РАН / МГИМО) ---
+    # --- Российские издания ---
     {
         "name": "Полис. Политические исследования",
-        "issns": ["1026-9487", "2071-8713"]
+        "issns": ["1026-9487", "1684-0070"]
     },
     {
         "name": "Современная Европа (ИЕ РАН)",
-        "issns": ["0201-7083", "2658-4824"]
+        "issns": ["0201-7083"]
     },
     {
         "name": "Политическая наука (ИНИОН РАН)",
@@ -50,15 +57,15 @@ CROSSREF_JOURNALS = [
     },
     {
         "name": "Россия в глобальной политике",
-        "issns": ["1810-6439", "2618-8597"]
+        "issns": ["1810-6439", "1810-6447"]
     },
     {
-        "name": "Мировая экономика и международные отношения (МЭиМО)",
-        "issns": ["0202-7496", "2686-7494"]
+        "name": "Мировая экономика и международные отношения (МЭиМО ИМЭМО РАН)",
+        "issns": ["0131-2227", "2782-4330"]  # Проверенный реальный ISSN МЭиМО
     },
     {
         "name": "Вестник Пермского университета. Политология",
-        "issns": ["2218-1067", "2412-7043"]
+        "issns": ["2218-1067", "3033-9456"]
     },
 
     # --- Мировые политологические издания ---
@@ -92,7 +99,7 @@ CROSSREF_JOURNALS = [
     },
     {
         "name": "Electoral Studies",
-        "issns": ["0261-3794"]
+        "issns": ["0261-3794", "1873-6890"]
     },
     {
         "name": "Democratization",
@@ -296,14 +303,10 @@ def main():
     seen = load_seen()
     new_seen = set(seen)
     
-    # ЕСЛИ БАЗА ПУСТАЯ — ВКЛЮЧАЕТСЯ РЕЖИМ ТИХОЙ ИНИЦИАЛИЗАЦИИ
-    is_first_run = (len(seen) == 0)
-
-    if is_first_run:
-        print("[INFO] База пуста. Режим ТИХОЙ ИНИЦИАЛИЗАЦИИ активирован.")
-        print("[INFO] Все текущие номера будут сохранены в базу БЕЗ публикации в Telegram.\n")
+    if SILENT_MODE:
+        print("[MODE] Включен SILENT_MODE (Тихая синхронизация). Публикаций в Telegram НЕ БУДЕТ.\n")
     else:
-        print(f"[INFO] База загружена. Ранее сохранено номеров: {len(seen)}\n")
+        print(f"[MODE] Боевой режим. Загружено ранее сохраненных номеров: {len(seen)}\n")
 
     for j_cfg in CROSSREF_JOURNALS:
         journal_name = j_cfg["name"]
@@ -326,13 +329,14 @@ def main():
             if vol:
                 issue_label = f"Том {vol}, {issue_label}"
 
-            # В режиме тихой инициализации просто запоминаем существующие номера
-            if is_first_run:
-                print(f"  [INIT SILENT] Запомнен: {journal_name} — {issue_label} ({len(articles)} ст.)")
-                new_seen.add(unique_issue_id)
+            # Если включен SILENT_MODE, просто сохраняем всё в базу
+            if SILENT_MODE:
+                if unique_issue_id not in new_seen:
+                    print(f"  [SILENT SYNC] Запомнен: {journal_name} — {issue_label} ({len(articles)} ст.)")
+                    new_seen.add(unique_issue_id)
                 continue
 
-            # В обычном режиме: если номера нет в базе — публикуем
+            # В боевом режиме: публикуем только то, чего ещё не было в базе
             if unique_issue_id in seen:
                 continue
 
@@ -342,11 +346,11 @@ def main():
 
     save_seen(new_seen)
 
-    if is_first_run:
-        print(f"\n[INFO] Инициализация завершена! В базу записано {len(new_seen)} существующих номеров.")
-        print("[INFO] В канал ничего не отправлено. Со следующего запуска бот начнет присылать только НОВЫЕ выпуски.")
+    if SILENT_MODE:
+        print(f"\n[INFO] Синхронизация завершена. В базу сохранено {len(new_seen)} номеров.")
+        print("[INFO] В канал ничего не отправлено. Теперь переключите SILENT_MODE = False.")
     else:
-        print(f"\n[INFO] Синхронизация завершена. Всего в базе: {len(new_seen)}")
+        print(f"\n[INFO] Работа завершена. Всего в базе: {len(new_seen)} номеров.")
 
 
 if __name__ == "__main__":
